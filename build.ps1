@@ -1,12 +1,21 @@
-param([string]$Template, [string]$Renderer)
-$ErrorActionPreference = 'Stop'
-if (-not $Template -or -not $Renderer) { throw 'Pass -Template original.hwpx -Renderer rhwp.exe' }
-$taskPython=(Get-Command python).Source
-$taskPythonDir=Split-Path $taskPython
-$taskOldPath=$env:PATH
-try {
-    # Prevent unrelated native DLLs (e.g. Poppler/libheif) on PATH from entering EXE.
-    $env:PATH="$env:SystemRoot\System32;$env:SystemRoot;$taskPythonDir"
-    & $taskPython -m PyInstaller --noconfirm --onefile --windowed --exclude-module numpy --name Attendance-proof-helper --add-data "${Template};." --add-binary "${Renderer};." --add-data "$PSScriptRoot\licenses;licenses" "$PSScriptRoot\main.py"
-    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-} finally { $env:PATH=$taskOldPath }
+# 단일 실행 파일(.exe) 빌드
+#   .\build.ps1 -Template C:\경로\양식.hwpx
+param(
+    [Parameter(Mandatory = $true)][string]$Template,
+    [string]$Icon = "assets\icon.png",
+    [string]$Name = "증빙 니가해"
+)
+
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+if (-not (Test-Path $Template)) { throw "양식 파일을 찾을 수 없습니다: $Template" }
+
+python make_template.py $Template
+python make_icon.py $Icon
+
+python -m PyInstaller --noconfirm --onefile --windowed `
+    --icon app_icon.ico --name $Name `
+    --distpath dist --workpath build --specpath . app.py
+
+Write-Host "완료: dist\$Name.exe"
