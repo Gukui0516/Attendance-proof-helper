@@ -1,0 +1,11 @@
+__pycache__/
+build/
+dist/
+*.spec
+template.hwpx
+form.png
+rhwp.exe
+*.hwpx
+*.ttf
+*.ttc
+*.otf
