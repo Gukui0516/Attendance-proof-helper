@@ -47,6 +47,10 @@ SIG_SRC = os.path.join(CFG_DIR, "signature_src.png")
 
 # ---- 양식 좌표 (원본 렌더링에서 실측, 단위 mm) --------------------------
 PAGE_W, PAGE_H = 297.0, 210.0
+PAGE2_W, PAGE2_H = 210.0, 297.0        # 2·3쪽은 세로 A4
+P2_ML, P2_MT = 20.0, 25.0              # 2·3쪽 왼쪽/위 여백
+HU2MM = 25.4 / 7200.0                  # HWPUNIT -> mm
+PAGE_NAMES = ["1쪽 · 사진 증빙", "2쪽 · 교육 프로그램", "3쪽 · 수기 출석부"]
 TBL_L, TBL_R = 20.3, 272.9
 TBL_W = TBL_R - TBL_L
 COL_F = [0.0, 0.07373, 0.34380, 0.47545, 0.60907, 0.71912, 1.0]
@@ -497,6 +501,7 @@ class App(tk.Tk):
         self.open_state = {}
         self.last_dir = os.path.expanduser("~")
         self.cur = 0                       # 미리보기로 보고 있는 교시
+        self.page = 0                      # 미리보기로 보고 있는 쪽 (0·1·2)
         self.photo_mode = 3                # 교시당 사진 수 (3장 또는 2장)
         self.sig_scale = 1.0               # 서명 크기 배율
         self.sig_dx = 0                    # 서명 좌우 이동(HWPUNIT)
@@ -565,6 +570,8 @@ class App(tk.Tk):
         p = {"v": {k: tk.StringVar(value=d[k]) for k in PERIOD_KEYS},
              "photos": [None, None, None], "names": ["", "", ""],
              "origs": [None, None, None], "crops": [None, None, None],
+             "att": None, "att_name": "",          # 수기 출석부 (마지막 쪽)
+             "src": None,                          # 불러온 hwpx 경로
              "auto": False}
         for var in p["v"].values():
             var.trace_add("write", lambda *a: self.on_change())
@@ -581,8 +588,8 @@ class App(tk.Tk):
         if len(self.periods) <= 1:
             return
         i = self.cur if i is None else i
-        if not messagebox.askyesno(APP_NAME, "%d교시를 지울까요?\n"
-                                             "이 교시의 사진도 함께 지워집니다." % (i + 1)):
+        if not messagebox.askyesno(APP_NAME, "%d교시를 지울까요?" % (i + 1) + chr(10)
+                                   + "이 교시의 사진과 수기 출석부도 함께 지워집니다."):
             return
         del self.periods[i]
         self.cur = min(self.cur, len(self.periods) - 1)
@@ -640,9 +647,9 @@ class App(tk.Tk):
         form = tk.Frame(cv, bg="white")
         cv.create_window((0, 0), window=form, anchor="nw", width=388)
         form.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind_all("<MouseWheel>", lambda e: cv.yview_scroll(int(-e.delta / 120), "units"))
         self.form = form
         self.formcv = cv
+        self.bind_all("<MouseWheel>", self.on_wheel)
 
         self.build_presets(form)
         self.build_common(form)
@@ -669,6 +676,10 @@ class App(tk.Tk):
         self.tabbar = tk.Frame(right, bg="#dfe3e9", height=36)
         self.tabbar.pack(fill="x")
         self.tabbar.pack_propagate(False)
+        self.pagebar = tk.Frame(right, bg="#e4e8ee", height=34)
+        self.pagebar.pack(side="bottom", fill="x")
+        self.pagebar.pack_propagate(False)
+        self.build_pagebar()
         self.cv = tk.Canvas(right, bg="#eef1f5", highlightthickness=0)
         self.cv.pack(fill="both", expand=True)
         self.cv.bind("<Configure>", lambda e: self.redraw())
@@ -678,6 +689,8 @@ class App(tk.Tk):
         self.cv.bind("<ButtonRelease-1>", self.canvas_release)
         self.cv.bind("<Double-Button-1>", self.canvas_double)
         self.cv.bind("<MouseWheel>", self.canvas_wheel)
+        self.bind_all("<Prior>", lambda e: self.key_page(e, -1))
+        self.bind_all("<Next>", lambda e: self.key_page(e, 1))
 
         self.rebuild_periods()
 
@@ -690,8 +703,9 @@ class App(tk.Tk):
         return s
 
     def hint(self, parent, text):
+        # 묶음 안쪽 너비는 316px 남짓이라 330 이면 오른쪽이 잘린다
         tk.Label(parent, text=text, bg="white", fg=C_MUTED, font=(UI_FONT, 8),
-                 wraplength=330, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
+                 wraplength=300, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
 
     def row_label(self, parent, i):
         """묶음 안에서 '1교시' 같은 줄 이름표."""
@@ -712,27 +726,41 @@ class App(tk.Tk):
                       activebackground="#dbe7fb",
                       command=lambda sp=spec, nm=name: self.apply_preset(nm, sp)).pack(
                 side="left", padx=(0, 6))
-        tk.Label(f, text="누르면 교육장소와 교시별 과정명·시간이 한 번에 채워집니다.",
-                 bg="white", fg="#aab2bd", font=(UI_FONT, 8), anchor="w").pack(
-            fill="x", padx=16)
+        tk.Button(row, text="기존 hwpx 열기", bg="white", fg=C_ACC, bd=1,
+                  relief="solid", font=(UI_FONT, 8), padx=8, pady=2,
+                  command=self.open_hwpx).pack(side="right")
+        tk.Label(f, text="누르면 교육장소·과정명·시간이 프리셋대로 덮어써지고 교육실시ID 는 비워집니다.",
+                 bg="white", fg="#aab2bd", font=(UI_FONT, 8), anchor="w",
+                 wraplength=356, justify="left").pack(fill="x", padx=16)
+        tk.Label(f, text="만들어 둔 .hwpx 를 창에 끌어다 놓아도 그대로 다시 편집할 수 있습니다.",
+                 bg="white", fg="#aab2bd", font=(UI_FONT, 8), anchor="w",
+                 wraplength=356, justify="left").pack(fill="x", padx=16)
 
     def apply_preset(self, name, spec):
         want = len(spec["periods"])
         if len(self.periods) > want:
             msg = "%s 프리셋을 적용하면 교시가 %d개로 맞춰집니다." % (name, want)
-            msg += chr(10) + "%d교시부터는 입력값과 사진이 함께 지워집니다. 계속할까요?" % (want + 1)
+            msg += chr(10) + "%d교시부터는 입력값과 사진이 함께 지워집니다." % (want + 1)
+            msg += chr(10) + chr(10) + "교육실시ID 는 모든 교시에서 비워집니다. 계속할까요?"
             if not messagebox.askyesno(APP_NAME, msg):
                 return
-        self.v["place"].set(spec["place"])
-        while len(self.periods) > want:
-            self.periods.pop()
-        while len(self.periods) < want:
-            self.add_period(silent=True)
-        for i, ps in enumerate(spec["periods"]):
-            v = self.periods[i]["v"]
-            v["course"].set(HB.COURSES[ps["course"]])
-            for k in ("sh", "sm", "eh", "em"):
-                v[k].set(ps[k])
+        self._loading = True
+        try:
+            self.v["place"].set(spec["place"])
+            while len(self.periods) > want:
+                self.periods.pop()
+            while len(self.periods) < want:
+                self.periods.append(self.new_period())
+            for i, ps in enumerate(spec["periods"]):
+                v = self.periods[i]["v"]
+                v["course"].set(HB.COURSES[ps["course"]])
+                v["eduid"].set("")        # 프리셋에 없는 값은 남기지 않는다
+                for k in ("sh", "sm", "eh", "em"):
+                    v[k].set(ps[k])
+                self.periods[i]["auto"] = False
+                self.periods[i]["src"] = None
+        finally:
+            self._loading = False
         self.cur = min(self.cur, len(self.periods) - 1)
         self.rebuild_periods()
         self.redraw()
@@ -794,6 +822,7 @@ class App(tk.Tk):
         self.sec_eduid = self.sec(c, "p_eduid", "교육실시ID")
         self.sec_time = self.sec(c, "p_time", "시작 / 종료 시간")
         self.sec_photo = self.sec(c, "p_photo", "증빙사진")
+        self.sec_att = self.sec(c, "p_att", "수기 출석부  ·  마지막 쪽(3쪽)에 첨부")
 
     def rebuild_periods(self):
         n = len(self.periods)
@@ -809,7 +838,8 @@ class App(tk.Tk):
             cb = ttk.Combobox(row, textvariable=p["v"]["course"], values=HB.COURSES,
                               state="readonly", font=(UI_FONT, 8))
             cb.pack(side="left", fill="x", expand=True, ipady=1)
-            cb.bind("<FocusIn>", lambda e, i=i: self.set_cur(i))
+            self.bind_pick(cb, i)
+            cb.bind("<MouseWheel>", self.wheel_scroll)
 
         # --- 교육실시ID ---
         self.sec_eduid.clear()
@@ -820,7 +850,7 @@ class App(tk.Tk):
             en = tk.Entry(row, textvariable=p["v"]["eduid"], font=(UI_FONT, 10),
                           relief="solid", bd=1)
             en.pack(side="left", fill="x", expand=True, ipady=3)
-            en.bind("<FocusIn>", lambda e, i=i: self.set_cur(i))
+            self.bind_pick(en, i)
 
         # --- 시작 / 종료 시간 ---
         self.sec_time.clear()
@@ -838,8 +868,10 @@ class App(tk.Tk):
                 c2.pack(side="left", padx=(2, 0))
                 tk.Label(row, text="분" + tail, bg="white",
                          font=(UI_FONT, 9)).pack(side="left")
-                for w in (c1, c2):
-                    w.bind("<FocusIn>", lambda e, i=i: self.set_cur(i))
+                for w, var, vals in ((c1, p["v"][hv], hours), (c2, p["v"][mv], mins)):
+                    self.bind_pick(w, i)
+                    w.bind("<MouseWheel>",
+                           lambda e, v=var, o=vals, i=i: self.wheel_pick(v, o, e, i))
 
         # --- 증빙사진 ---
         self.sec_photo.clear()
@@ -898,6 +930,37 @@ class App(tk.Tk):
         self.hint(body, "탐색기에서 사진을 창 위로 끌어다 놓으면 빈 자리부터 차례대로 들어갑니다. "
                         "한 번에 고른 사진은 위에서부터 1교시 전·중·후 → 2교시 … 순서로 채워집니다.")
         self.hint(body, "목록의 줄을 끌어다 놓으면 순서를 바꿀 수 있고, 교시 경계를 넘어서도 옮겨집니다.")
+
+        # --- 수기 출석부 (문서 마지막 쪽) ---
+        self.sec_att.clear()
+        ab = self.sec_att.body
+        r0 = tk.Frame(ab, bg="white")
+        r0.pack(fill="x")
+        tk.Button(r0, text="보고 있는 교시에 붙여넣기", font=(UI_FONT, 8), relief="solid",
+                  bd=1, bg="white", command=self.paste_att).pack(fill="x")
+        self.att_rows = []
+        alst = tk.Frame(ab, bg="white")
+        alst.pack(fill="x", pady=(6, 0))
+        for i, p in enumerate(self.periods):
+            r = tk.Frame(alst, bg="white", height=30, highlightthickness=1,
+                         highlightbackground="#e6e9ee")
+            r.pack(fill="x", pady=(0, 3))
+            r.pack_propagate(False)
+            tk.Label(r, text="%d교시" % (i + 1), bg=C_ACC_W, fg=C_ACC,
+                     font=(UI_FONT, 8, "bold"), width=10).pack(side="left", fill="y")
+            nm = tk.Label(r, text="", bg="white", font=(UI_FONT, 8), anchor="w",
+                          padx=8, cursor="hand2")
+            nm.pack(side="left", fill="both", expand=True)
+            nm.bind("<Button-1>", lambda e, i=i: self.pick_att(i))
+            xb = tk.Label(r, text="✕", bg="white", fg="#98a1ae", font=(UI_FONT, 8),
+                          padx=7, cursor="hand2")
+            xb.pack(side="right")
+            xb.bind("<Button-1>", lambda e, i=i: self.clear_att(i))
+            self.att_rows.append(nm)
+        self.refresh_att_rows()
+        self.hint(ab, "줄을 누르면 그 교시의 출석부 사진(또는 스캔 파일)을 고릅니다.")
+        self.hint(ab, "넣어둔 교시의 문서에만 3쪽이 한 장 통째로 붙습니다. "
+                      "비워두면 그 교시는 지금처럼 2쪽까지만 만들어집니다.")
 
         self.rebuild_tabs()
         self.update_thumbs()
@@ -1026,6 +1089,242 @@ class App(tk.Tk):
                                fg="#1c2530" if im is not None else "#aab2bd")
             r.config(highlightbackground="#e6e9ee", highlightthickness=1)
 
+    # ----- 입력칸 고르기 / 휠 -----
+    def bind_pick(self, w, i):
+        """직접 누르거나 값을 고를 때만 그 교시를 미리보기로 가져온다.
+
+        예전에는 <FocusIn> 을 썼는데, 사진 편집 창을 닫거나 다른 프로그램을 쓰다
+        돌아오면 초점이 되살아나면서 엉뚱한 교시로 넘어가 버렸다.
+        """
+        w.bind("<Button-1>", lambda e, i=i: self.set_cur(i), add="+")
+        w.bind("<<ComboboxSelected>>", lambda e, i=i: self.set_cur(i), add="+")
+        w.bind("<KeyRelease>", lambda e, i=i: self.set_cur(i), add="+")
+
+    def wheel_scroll(self, e):
+        """휠로 값이 바뀌면 곤란한 칸. 설정창만 평소처럼 굴러가게 한다."""
+        self.formcv.yview_scroll(int(-e.delta / 120), "units")
+        return "break"
+
+    def wheel_pick(self, var, values, e, i):
+        """콤보 상자 위에서 휠을 굴리면 값이 바뀐다 (설정창은 안 움직인다)."""
+        self.set_cur(i)
+        try:
+            n = values.index(var.get())
+        except ValueError:
+            n = 0
+        n = max(0, min(len(values) - 1, n + (-1 if e.delta > 0 else 1)))
+        var.set(values[n])
+        return "break"
+
+    def on_wheel(self, e):
+        """설정창 세로 스크롤.
+
+        콤보 상자와 펼쳐진 목록 위에서는 설정창이 따라 움직이지 않게 한다.
+        """
+        try:
+            path = str(self.tk.call("winfo", "containing", e.x_root, e.y_root) or "")
+        except Exception:
+            return
+        if not path:
+            return
+        try:
+            cls = str(self.tk.call("winfo", "class", path))
+        except Exception:
+            cls = ""
+        if cls in ("TCombobox", "Listbox", "TScale", "Scale"):
+            return
+        base = str(self.formcv)
+        if path == base or path.startswith(base + "."):
+            self.formcv.yview_scroll(int(-e.delta / 120), "units")
+
+    # ----- 만들어 둔 hwpx 다시 열어 편집하기 -----
+    def has_any_input(self):
+        for p in self.periods:
+            if p["att"] is not None or p["v"]["eduid"].get().strip():
+                return True
+            if any(im is not None for im in p["photos"]):
+                return True
+        return False
+
+    def open_hwpx(self):
+        paths = filedialog.askopenfilenames(
+            title="기존 hwpx 열기 (여러 개 고르면 고른 순서대로 교시가 됩니다)",
+            initialdir=self.last_dir,
+            filetypes=[("한글 문서", "*.hwpx"), ("모든 파일", "*.*")])
+        if paths:
+            self.load_hwpx(list(paths))
+
+    def load_hwpx(self, paths):
+        """이 프로그램이 만든 hwpx 를 읽어 교시로 되돌린다."""
+        docs, bad = [], []
+        for path in paths:
+            try:
+                docs.append((path, HB.read_hwpx(path)))
+            except Exception as ex:
+                bad.append("%s  —  %s" % (os.path.basename(path), ex))
+        if not docs:
+            messagebox.showerror(APP_NAME, "읽을 수 있는 파일이 없습니다."
+                                 + chr(10) + chr(10) + chr(10).join(bad))
+            return
+
+        replace = True
+        if self.has_any_input():
+            replace = messagebox.askyesno(
+                APP_NAME, "지금 입력해 둔 내용을 모두 지우고 불러올까요?"
+                + chr(10) + chr(10) + "[아니오] 를 고르면 뒤에 교시로 이어 붙입니다.")
+
+        self._loading = True
+        try:
+            if replace:
+                self.periods = []
+            base_n = len(self.periods)
+            for path, d in docs:
+                nm = os.path.splitext(os.path.basename(path))[0]
+                p = self.new_period()
+                v = p["v"]
+                v["course"].set(d["course"])
+                v["eduid"].set(d["eduid"])
+                v["sh"].set(str(d["sh"]))
+                v["sm"].set("%02d" % d["sm"])
+                v["eh"].set(str(d["eh"]))
+                v["em"].set("%02d" % d["em"])
+                for k, im in enumerate(d["photos"]):
+                    if im is None:
+                        continue
+                    p["origs"][k] = im
+                    p["photos"][k] = fit_photo(im)
+                    p["names"][k] = "%s · %s" % (nm, SLOT_NAMES[k])
+                if d["att"] is not None:
+                    p["att"] = d["att"]
+                    p["att_name"] = "%s · 출석부" % nm
+                p["src"] = path
+                self.periods.append(p)
+
+            first = docs[0][1]
+            if replace:
+                for k in COMMON_KEYS:
+                    self.v[k].set(first[k])
+                self.date = [self.date[0], first["month"], first["day"]]
+                self.cal.set(*self.date)
+                self.sig_scale = first["sig_scale"]
+                self.sig_dx, self.sig_dy = first["sig_dx"], first["sig_dy"]
+                self.clamp_sig()
+                if self.signature is None and first["signature"] is not None:
+                    self.signature = first["signature"]
+                    self._sig_raw = None
+                    self.save_sig()
+        finally:
+            self._loading = False
+
+        self.last_dir = os.path.dirname(docs[0][0]) or self.last_dir
+        self.cur = base_n if not replace else 0
+        self.page = 0
+        self.rebuild_periods()
+        self.update_thumbs()
+        self.redraw()
+
+        msg = "%d개 파일을 불러왔습니다." % len(docs)
+        if not replace:
+            msg += "  (%d교시부터)" % (base_n + 1)
+        if bad:
+            msg += chr(10) + chr(10) + "못 읽은 파일:" + chr(10) + chr(10).join(bad)
+        messagebox.showinfo(APP_NAME, msg)
+
+    # ----- 수기 출석부 (문서 마지막 쪽) -----
+    def refresh_att_rows(self):
+        for i, nm in enumerate(getattr(self, "att_rows", [])):
+            if i >= len(self.periods):
+                continue
+            p = self.periods[i]
+            on = p["att"] is not None
+            nm.config(text=p["att_name"] if on else "없음  (이 교시는 2쪽까지)",
+                      fg="#1c2530" if on else "#aab2bd")
+
+    def set_att(self, i, im, name):
+        self.periods[i]["att"] = im
+        self.periods[i]["att_name"] = name
+        self.refresh_att_rows()
+        self.redraw()
+
+    def pick_att(self, i):
+        self.set_cur(i)
+        path = filedialog.askopenfilename(
+            title="%d교시 수기 출석부 이미지 선택" % (i + 1), initialdir=self.last_dir,
+            filetypes=[("이미지 파일", "*.jpg *.jpeg *.png *.bmp *.gif *.webp *.tif *.tiff"),
+                       ("모든 파일", "*.*")])
+        if not path:
+            return
+        self.last_dir = os.path.dirname(path)
+        try:
+            im = load_image(path)
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, "이미지를 열 수 없습니다." + chr(10) + str(ex))
+            return
+        self.set_att(i, im, os.path.basename(path))
+        self.set_page(2)
+
+    def clear_att(self, i):
+        if self.periods[i]["att"] is None:
+            return
+        self.set_att(i, None, "")
+
+    def paste_att(self):
+        im = self.clipboard_image()
+        if im is None:
+            messagebox.showinfo(APP_NAME, "클립보드에 이미지가 없습니다.")
+            return
+        self.set_att(self.cur, im, "붙여넣은 출석부")
+        self.set_page(2)
+
+    # ----- 미리보기 쪽 넘김 -----
+    def build_pagebar(self):
+        for w in self.pagebar.winfo_children():
+            w.destroy()
+        prev = tk.Label(self.pagebar, text="◀", bg="#e4e8ee", fg="#5b6472",
+                        font=(UI_FONT, 10), padx=12, cursor="hand2")
+        prev.pack(side="left", fill="y")
+        prev.bind("<Button-1>", lambda e: self.set_page(self.page - 1))
+        self.page_w = []
+        for n, t in enumerate(PAGE_NAMES):
+            b = tk.Label(self.pagebar, text=t, bg="#e4e8ee", fg="#5b6472",
+                         font=(UI_FONT, 9), padx=12, cursor="hand2")
+            b.pack(side="left", fill="y", padx=(0, 2))
+            b.bind("<Button-1>", lambda e, n=n: self.set_page(n))
+            self.page_w.append(b)
+        nxt = tk.Label(self.pagebar, text="▶", bg="#e4e8ee", fg="#5b6472",
+                       font=(UI_FONT, 10), padx=12, cursor="hand2")
+        nxt.pack(side="left", fill="y")
+        nxt.bind("<Button-1>", lambda e: self.set_page(self.page + 1))
+        self.page_note = tk.Label(self.pagebar, text="", bg="#e4e8ee", fg="#8a93a0",
+                                  font=(UI_FONT, 8))
+        self.page_note.pack(side="right", padx=12)
+        self.mark_page()
+
+    def key_page(self, e, d):
+        if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return
+        self.set_page(self.page + d)
+
+    def set_page(self, n):
+        n = max(0, min(len(PAGE_NAMES) - 1, n))
+        if n == self.page:
+            return
+        self.page = n
+        self.redraw()
+
+    def mark_page(self):
+        for n, b in enumerate(getattr(self, "page_w", [])):
+            on = (n == self.page)
+            b.config(bg="white" if on else "#e4e8ee",
+                     fg="#1c2530" if on else "#5b6472",
+                     font=(UI_FONT, 9, "bold" if on else "normal"))
+        if not hasattr(self, "page_note"):
+            return
+        has = self.periods[self.cur]["att"] is not None
+        self.page_note.config(
+            text="%d교시 문서는 %d쪽" % (self.cur + 1, 3 if has else 2)
+                 + ("  ·  3쪽 = 수기 출석부" if has else "  ·  출석부 없음"))
+
     # ----- 탐색기에서 파일 끌어다 놓기 (Windows WM_DROPFILES) -----
     def enable_file_drop(self):
         try:
@@ -1070,7 +1369,11 @@ class App(tk.Tk):
             self._drop_ok = False
 
     def drop_files(self, paths):
-        """끌어다 놓은 이미지를 빈 자리부터 차례대로 채운다."""
+        """끌어다 놓은 이미지는 빈 자리부터, hwpx 는 교시로 되돌린다."""
+        docs = [p for p in paths
+                if os.path.isfile(p) and os.path.splitext(p)[1].lower() == ".hwpx"]
+        if docs:
+            self.load_hwpx(sorted(docs))
         imgs = [p for p in paths
                 if os.path.isfile(p) and os.path.splitext(p)[1].lower() in IMG_EXT]
         if not imgs:
@@ -1412,15 +1715,19 @@ class App(tk.Tk):
                     APP_NAME, "%d교시의 %s 사진이 비어 있습니다.\n그대로 저장할까요?"
                               % (i + 1, ", ".join(miss))):
                 return
+        src = self.periods[i].get("src")     # 불러와서 고친 파일이면 그 자리에 덮어쓰기
         p = filedialog.asksaveasfilename(
-            title="%d교시 hwpx 저장" % (i + 1), initialdir=self.last_dir,
-            initialfile=HB.file_name(st), defaultextension=".hwpx",
+            title="%d교시 hwpx 저장" % (i + 1),
+            initialdir=os.path.dirname(src) if src else self.last_dir,
+            initialfile=os.path.basename(src) if src else HB.file_name(st),
+            defaultextension=".hwpx",
             filetypes=[("한글 문서", "*.hwpx"), ("모든 파일", "*.*")])
         if not p:
             return
         try:
             data = HB.build_hwpx(st, self.periods[i]["photos"], self.signature,
-                                 self.sig_scale, self.sig_dx, self.sig_dy)
+                                 self.sig_scale, self.sig_dx, self.sig_dy,
+                                 self.periods[i]["att"])
             with open(p, "wb") as fp:
                 fp.write(data)
         except Exception:
@@ -1445,7 +1752,8 @@ class App(tk.Tk):
             used.add(name)
             try:
                 data = HB.build_hwpx(st, self.periods[i]["photos"], self.signature,
-                                 self.sig_scale, self.sig_dx, self.sig_dy)
+                                     self.sig_scale, self.sig_dx, self.sig_dy,
+                                     self.periods[i]["att"])
                 with open(os.path.join(folder, name), "wb") as fp:
                     fp.write(data)
                 done.append("%d교시  →  %s" % (i + 1, name))
@@ -1490,7 +1798,11 @@ class App(tk.Tk):
         hit = self.sig_hit(e)
         cur = {"size": "sizing", "move": "fleur"}.get(hit, "")
         if not hit:
-            for x1, y1, x2, y2 in getattr(self, "_cell_boxes", []):
+            boxes = list(getattr(self, "_cell_boxes", []))
+            att = getattr(self, "_att_box", None)
+            if att:
+                boxes.append(att)
+            for x1, y1, x2, y2 in boxes:
                 if x1 <= e.x <= x2 and y1 <= e.y <= y2:
                     cur = "hand2"
                     break
@@ -1503,6 +1815,11 @@ class App(tk.Tk):
             self.cv.config(cursor=cur)
 
     def canvas_press(self, e):
+        if self.page:
+            b = getattr(self, "_att_box", None)
+            if b and b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3]:
+                self.pick_att(self.cur)
+            return
         self._sig_mode = self.sig_hit(e)
         if self._sig_mode:
             x1, y1, x2, y2 = self._sig_box
@@ -1606,19 +1923,36 @@ class App(tk.Tk):
             return
         c.delete("all")
         self._imgcache = {}
-        self.s = min((W - 34) / PAGE_W, (H - 34) / PAGE_H)
+        self._cell_boxes = []
+        self._sig_box = None
+        self._att_box = None
+        pw, ph = (PAGE_W, PAGE_H) if self.page == 0 else (PAGE2_W, PAGE2_H)
+        self.s = min((W - 34) / pw, (H - 34) / ph)
         s = self.s
-        self.ox = (W - PAGE_W * s) / 2.0
-        self.oy = (H - PAGE_H * s) / 2.0
+        self.ox = (W - pw * s) / 2.0
+        self.oy = (H - ph * s) / 2.0
         X, Y = self.X, self.Y
         st = self.state()
 
         self.fname_lbl.config(text="%d교시  →  %s" % (self.cur + 1, HB.file_name(st)))
 
-        c.create_rectangle(X(0) + 3, Y(0) + 3, X(PAGE_W) + 3, Y(PAGE_H) + 3,
+        c.create_rectangle(X(0) + 3, Y(0) + 3, X(pw) + 3, Y(ph) + 3,
                            fill="#dfe3e9", outline="")
-        c.create_rectangle(X(0), Y(0), X(PAGE_W), Y(PAGE_H), fill="white",
+        c.create_rectangle(X(0), Y(0), X(pw), Y(ph), fill="white",
                            outline="#c8ccd2")
+        if self.page == 1:
+            self.draw_program()
+        elif self.page == 2:
+            self.draw_attend()
+        else:
+            self.draw_form(st)
+        self.mark_page()
+
+    # ---- 1쪽: 사진 증빙 양식 ----
+    def draw_form(self, st):
+        c = self.cv
+        s = self.s
+        X, Y = self.X, self.Y
 
         cx = X((TBL_L + TBL_R) / 2.0)
 
@@ -1746,6 +2080,87 @@ class App(tk.Tk):
         c.create_text(X(20.0), Y(Y_N2), text=NOTE2, anchor="w",
                       font=self.font_fit(NOTE2, 11, False, nw, italic=True))
 
+    # ---- 2쪽: 교육 프로그램 표 (원본 양식 그대로) ----
+    def draw_program(self):
+        c = self.cv
+        s = self.s
+        X, Y = self.X, self.Y
+        pg = HB.program_page()
+        if not pg["cols"]:
+            return
+        c.create_text(X(P2_ML), Y(P2_MT + 3.0), text=pg["title"], anchor="w",
+                      font=self.font_fit(pg["title"], 13, True,
+                                         (PAGE2_W - 2 * P2_ML) * s))
+        xs = [P2_ML]
+        for w in pg["cols"]:
+            xs.append(xs[-1] + w * HU2MM)
+        ys = [P2_MT + 11.0]
+        for h in pg["rows"]:
+            ys.append(ys[-1] + h * HU2MM)
+
+        thin, thick = self.lw(THIN), self.lw(THICK)
+        c.create_rectangle(X(xs[0]), Y(ys[0]), X(xs[-1]), Y(ys[1]),
+                           fill=FILL_HEAD, outline="")
+        for col, row, cs, rs, txt in pg["cells"]:
+            a, b = X(xs[col]), X(xs[min(col + cs, len(xs) - 1)])
+            t, d = Y(ys[row]), Y(ys[min(row + rs, len(ys) - 1)])
+            c.create_rectangle(a, t, b, d, outline="black", width=thin)
+            if not txt:
+                continue
+            head = (row == 0)
+            f = self.font(9.5, head)
+            left = (col == 1 and not head)
+            lines = self.wrap(txt, f, (b - a) - 3.0 * s)
+            lh = 9.5 * 0.3528 * 1.3 * s
+            ym = (t + d) / 2.0 - (len(lines) - 1) * lh / 2.0
+            for n, ln in enumerate(lines):
+                if left:
+                    c.create_text(a + 1.5 * s, ym + n * lh, text=ln, font=f,
+                                  anchor="w")
+                else:
+                    c.create_text((a + b) / 2.0, ym + n * lh, text=ln, font=f,
+                                  anchor="center")
+        c.create_rectangle(X(xs[0]), Y(ys[0]), X(xs[-1]), Y(ys[-1]),
+                           outline="black", width=thick)
+        c.create_text(X(P2_ML), Y(ys[-1] + 7.0), anchor="w", fill="#aab2bd",
+                      text="이 쪽은 원본 양식 그대로 들어갑니다. 여기서는 고칠 수 없습니다.",
+                      font=self.font(9))
+
+    # ---- 3쪽: 수기 출석부 ----
+    def draw_attend(self):
+        c = self.cv
+        s = self.s
+        X, Y = self.X, self.Y
+        L, T = P2_ML, P2_MT
+        R, B = PAGE2_W - P2_ML, PAGE2_H - 24.0
+        self._att_box = (X(L), Y(T), X(R), Y(B))
+        im = self.periods[self.cur]["att"]
+        if im is None:
+            c.create_rectangle(X(L), Y(T), X(R), Y(B), outline="#c9ced6",
+                               dash=(5, 4))
+            c.create_text(X((L + R) / 2.0), Y((T + B) / 2.0 - 6.0),
+                          text="수기 출석부 없음", fill="#aab2bd",
+                          font=self.font(15, True))
+            c.create_text(X((L + R) / 2.0), Y((T + B) / 2.0 + 3.0), fill="#c9ced6",
+                          text="여기를 누르면 이미지를 고릅니다.", font=self.font(10))
+            c.create_text(X((L + R) / 2.0), Y((T + B) / 2.0 + 10.0), fill="#c9ced6",
+                          text="넣지 않으면 %d교시 문서는 2쪽까지만 만들어집니다."
+                               % (self.cur + 1), font=self.font(10))
+            return
+        aw, ah = (R - L) * s, (B - T) * s
+        k = min(aw / im.size[0], ah / im.size[1])
+        tw = max(8, int(round(im.size[0] * k)))
+        th = max(8, int(round(im.size[1] * k)))
+        ph = ImageTk.PhotoImage(im.convert("RGB").resize((tw, th), Image.LANCZOS))
+        self._imgcache["att"] = ph
+        c.create_image(X((L + R) / 2.0), Y((T + B) / 2.0), image=ph, anchor="center")
+        c.create_rectangle(X((L + R) / 2.0) - tw / 2.0, Y((T + B) / 2.0) - th / 2.0,
+                           X((L + R) / 2.0) + tw / 2.0, Y((T + B) / 2.0) + th / 2.0,
+                           outline="#c8ccd2")
+        c.create_text(X((L + R) / 2.0), Y(B + 7.0), fill="#aab2bd",
+                      text=self.periods[self.cur]["att_name"] or "수기 출석부",
+                      font=self.font(9))
+
     # ---------------- 왼쪽 썸네일 ----------------
     def update_thumbs(self):
         if not hasattr(self, "sig_lbl"):
@@ -1764,6 +2179,13 @@ class App(tk.Tk):
             self.sig_lbl.config(image=ph, text="", height=72)
 
     def destroy(self):
+        job = getattr(self, "_save_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._save_job = None
         self.save_config()
         tk.Tk.destroy(self)
 
