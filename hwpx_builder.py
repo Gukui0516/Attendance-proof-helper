@@ -5,7 +5,9 @@ import base64
 import io
 import re
 import zipfile
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, unescape
+
+from PIL import Image
 
 try:
     from template_data import TPL
@@ -23,6 +25,13 @@ SIG_H = 2254                   # 서명 높이(원본과 동일)
 SIG_RIGHT = 71802              # 서명 오른쪽 끝 위치
 SIG_VOFF = 791                 # 서명 세로 위치
 PX2HU = 75                     # 96dpi 픽셀 -> HWPUNIT
+
+# 마지막 쪽(수기 출석부)이 들어갈 자리. 2쪽과 같은 세로 A4(59528 x 84186) 기준.
+ATT_PAPER_W, ATT_PAPER_H = 59528, 84186
+ATT_L, ATT_T = 5669, 7087      # 좌우 여백 / 위 여백(4252) + 머리말(2835)
+ATT_W = ATT_PAPER_W - ATT_L * 2                 # 48190
+ATT_H = ATT_PAPER_H - ATT_T * 2                 # 70012
+ATT_MAX_PX = 2200              # 출석부는 글씨를 읽어야 하므로 넉넉하게
 
 # 1교시 -> 에듀버스1, 2교시 -> 에듀버스2, 3교시 -> 에듀버스3 순서
 COURSES = [
@@ -179,8 +188,255 @@ def _fill_cell(xml, cell_addr, inner, para_pr=None, char_pr=None):
     return pre + '<hp:run charPrIDRef="%s">%s</hp:run>' % (cid, inner) + post + tail
 
 
+# ---- 2쪽(교육 프로그램 표) 읽어오기 — 미리보기용 -----------------------
+_PROGRAM = None
+
+
+def program_page():
+    """양식 2쪽에 이미 들어 있는 교육 프로그램 표를 그대로 읽어온다.
+
+    돌려주는 값: {"title": 제목, "cols": [칸 너비], "rows": [줄 높이],
+                  "cells": [(열, 줄, 열병합, 줄병합, 글자)]}
+    치수는 모두 HWPUNIT.
+    """
+    global _PROGRAM
+    if _PROGRAM is not None:
+        return _PROGRAM
+    sec1 = base64.b64decode(TPL["Contents/section1.xml"]).decode("utf-8")
+    body = sec1[:sec1.index("<hp:tbl")]
+    title = "".join(re.findall(r"<hp:t>([^<]*)</hp:t>", body)).strip()
+
+    cells, cols, rows = [], {}, {}
+    for m in re.finditer(r"<hp:tc[ >].*?</hp:tc>", sec1, re.S):
+        tc = m.group(0)
+        a = re.search(r'<hp:cellAddr colAddr="(\d+)" rowAddr="(\d+)"/>', tc)
+        sp = re.search(r'<hp:cellSpan colSpan="(\d+)" rowSpan="(\d+)"/>', tc)
+        sz = re.search(r'<hp:cellSz width="(\d+)" height="(\d+)"/>', tc)
+        if not (a and sp and sz):
+            continue
+        col, row = int(a.group(1)), int(a.group(2))
+        cs, rs = int(sp.group(1)), int(sp.group(2))
+        w, h = int(sz.group(1)), int(sz.group(2))
+        txt = "".join(re.findall(r"<hp:t>([^<]*)</hp:t>", tc)).strip()
+        cells.append((col, row, cs, rs, txt))
+        if cs == 1:
+            cols[col] = w
+        if rs == 1:
+            rows[row] = h
+    _PROGRAM = {
+        "title": title,
+        "cols": [cols.get(i, 10000) for i in range(max(cols) + 1)] if cols else [],
+        "rows": [rows.get(i, 2600) for i in range(max(rows) + 1)] if rows else [],
+        "cells": cells,
+    }
+    return _PROGRAM
+
+
+# ---- 3쪽(수기 출석부) --------------------------------------------------
+def attend_fit(im):
+    """출석부 이미지를 쪽 크기에 맞춰 줄인다."""
+    im = im.convert("RGB")
+    w, h = im.size
+    m = max(w, h)
+    if m > ATT_MAX_PX:
+        k = ATT_MAX_PX / float(m)
+        im = im.resize((max(1, int(round(w * k))), max(1, int(round(h * k)))),
+                       Image.LANCZOS)
+    return im
+
+
+def _attend_size(pw, ph):
+    """쪽 안에 꽉 차되 넘치지 않는 크기(HWPUNIT)."""
+    w, h = ATT_W, int(round(ATT_W * ph / float(pw)))
+    if h > ATT_H:
+        h = ATT_H
+        w = int(round(ATT_H * pw / float(ph)))
+    return max(1, w), max(1, h)
+
+
+def _attend_xml(bin_id, w, h, ow, oh):
+    """출석부 그림을 종이 한가운데에 고정한다.
+
+    문단 안에 글자처럼 넣으면 줄간격(180%) 때문에 쪽을 넘어가므로,
+    종이 기준 절대 위치로 붙인다.
+    """
+    x = ATT_L + (ATT_W - w) // 2
+    y = ATT_T + (ATT_H - h) // 2
+    return (
+        '<hp:pic id="1600000001" zOrder="20" numberingType="PICTURE"'
+        ' textWrap="BEHIND_TEXT" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None"'
+        ' href="" groupLevel="0" instid="1600000002" reverse="0">'
+        '<hp:offset x="0" y="0"/>'
+        '<hp:orgSz width="%d" height="%d"/>'
+        '<hp:curSz width="%d" height="%d"/>'
+        '<hp:flip horizontal="0" vertical="0"/>'
+        '<hp:rotationInfo angle="0" centerX="%d" centerY="%d" rotateimage="1"/>'
+        '<hp:renderingInfo>'
+        '<hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/>'
+        '<hc:scaMatrix e1="%.6f" e2="0" e3="0" e4="0" e5="%.6f" e6="0"/>'
+        '<hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/>'
+        '</hp:renderingInfo>'
+        '<hc:img binaryItemIDRef="%s" bright="0" contrast="0" effect="REAL_PIC" alpha="0"/>'
+        '<hp:imgRect><hc:pt0 x="0" y="0"/><hc:pt1 x="%d" y="0"/>'
+        '<hc:pt2 x="%d" y="%d"/><hc:pt3 x="0" y="%d"/></hp:imgRect>'
+        '<hp:imgClip left="0" right="%d" top="0" bottom="%d"/>'
+        '<hp:inMargin left="0" right="0" top="0" bottom="0"/>'
+        '<hp:imgDim dimwidth="%d" dimheight="%d"/><hp:effects/>'
+        '<hp:sz width="%d" widthRelTo="ABSOLUTE" height="%d" heightRelTo="ABSOLUTE" protect="0"/>'
+        '<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1"'
+        ' holdAnchorAndSO="0" vertRelTo="PAPER" horzRelTo="PAPER" vertAlign="TOP"'
+        ' horzAlign="LEFT" vertOffset="%d" horzOffset="%d"/>'
+        '<hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:pic>'
+    ) % (ow, oh, w, h, w // 2, h // 2, w / ow, h / oh, bin_id,
+         ow, ow, oh, oh, ow, oh, ow, oh, w, h, y, x)
+
+
+# ---- 이미 만들어 둔 hwpx 다시 읽기 -------------------------------------
+COURSE_CELL = '<hp:cellAddr colAddr="1" rowAddr="1"/>'
+DATE_CELL = '<hp:cellAddr colAddr="7" rowAddr="1"/>'
+
+
+def _s32(v):
+    """HWPML 이 32비트 부호없는 값으로 적어둔 위치를 되돌린다."""
+    v = int(v)
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def _tc_span(xml, cell_addr):
+    """cellAddr 로 지정한 칸의 XML 범위."""
+    idx = xml.index(cell_addr)
+    return xml.rindex("<hp:tc", 0, idx), idx
+
+
+def _cell_text(xml, cell_addr):
+    try:
+        a, b = _tc_span(xml, cell_addr)
+    except ValueError:
+        return ""
+    return unescape("".join(re.findall(r"<hp:t>([^<]*)</hp:t>", xml[a:b])))
+
+
+def _cell_bin(xml, cell_addr):
+    try:
+        a, b = _tc_span(xml, cell_addr)
+    except ValueError:
+        return None
+    m = re.search(r'binaryItemIDRef="([^"]+)"', xml[a:b])
+    return m.group(1) if m else None
+
+
+def _norm(s):
+    return " ".join((s or "").split())
+
+
+def match_course(text):
+    """띄어쓰기가 조금 달라도 원래 과정명으로 맞춰준다."""
+    t = _norm(text)
+    for c in COURSES:
+        if _norm(c) == t:
+            return c
+    for c in COURSES:
+        key = c.split("]")[0] + "]"          # [에듀버스2] 같은 앞머리
+        if key and key in t:
+            return c
+    return text or COURSES[0]
+
+
+def parse_headline(text):
+    """'강사: A / 보조강사: B / 교육장소 : C' 를 도로 나눈다."""
+    out = {"lead": False, "lead_name": "", "asst": False, "asst_name": "",
+           "place": ""}
+    for part in (text or "").split(" / "):
+        part = part.strip()
+        if part.startswith("보조강사:"):
+            out["asst"] = True
+            out["asst_name"] = part[len("보조강사:"):].strip()
+        elif part.startswith("강사:"):
+            out["lead"] = True
+            out["lead_name"] = part[len("강사:"):].strip()
+        elif part.startswith("교육장소"):
+            out["place"] = part.split(":", 1)[-1].strip()
+    return out
+
+
+def parse_date(text):
+    m = re.search(r"(\d+)월\s*(\d+)일\s*(\d+)시\s*(\d+)분\s*~\s*(\d+)시\s*(\d+)분",
+                  text or "")
+    if not m:
+        return {}
+    n = [int(x) for x in m.groups()]
+    return {"month": n[0], "day": n[1], "sh": n[2], "sm": n[3],
+            "eh": n[4], "em": n[5]}
+
+
+def read_hwpx(path):
+    """이 프로그램이 만든 .hwpx 를 다시 읽어 입력값과 그림을 돌려준다.
+
+    양식이 다르면 ValueError 를 낸다.
+    """
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        if "Contents/section0.xml" not in names:
+            raise ValueError("hwpx 파일이 아닙니다.")
+        sec0 = z.read("Contents/section0.xml").decode("utf-8")
+        sec1 = (z.read("Contents/section1.xml").decode("utf-8")
+                if "Contents/section1.xml" in names else "")
+        if ID_CELL not in sec0 or PHOTO_CELLS[0] not in sec0:
+            raise ValueError("이 프로그램이 쓰는 증빙 양식이 아닙니다.")
+
+        def img(bid, ext):
+            for nm in ("BinData/%s.%s" % (bid, ext), "BinData/%s.jpg" % bid,
+                       "BinData/%s.png" % bid):
+                if nm in names:
+                    im = Image.open(io.BytesIO(z.read(nm)))
+                    im.load()
+                    return im
+            return None
+
+        m = re.search(r'paraPrIDRef="24"[^>]*><hp:run charPrIDRef="20">'
+                      r"<hp:t>([^<]*)</hp:t>", sec0)
+        d = parse_headline(unescape(m.group(1)) if m else "")
+
+        d.update(parse_date(_cell_text(sec0, DATE_CELL)))
+        d.setdefault("month", 1)
+        d.setdefault("day", 1)
+        for k, dv in (("sh", 9), ("sm", 30), ("eh", 10), ("em", 30)):
+            d.setdefault(k, dv)
+        d["course"] = match_course(_cell_text(sec0, COURSE_CELL))
+        d["eduid"] = _cell_text(sec0, ID_CELL).strip()
+
+        m = re.search(r"<hp:t>제출자:([^<]*)</hp:t>", sec0)
+        sub = unescape(m.group(1)) if m else ""
+        d["submitter"] = sub.replace("(서명)", "").strip()
+
+        d["photos"] = [img(_cell_bin(sec0, c) or "", "jpg") if _cell_bin(sec0, c)
+                       else None for c in PHOTO_CELLS]
+
+        att_id = None
+        m = re.search(r'binaryItemIDRef="(image9)"', sec1)
+        if m:
+            att_id = m.group(1)
+        d["att"] = img(att_id, "jpg") if att_id else None
+
+        d["signature"] = None
+        d["sig_scale"], d["sig_dx"], d["sig_dy"] = 1.0, 0, 0
+        m = re.search(r'<hp:pic id="1198036548".*?</hp:pic>', sec0, re.S)
+        if m:
+            pic = m.group(0)
+            sz = re.search(r'<hp:sz width="(\d+)"[^>]*height="(\d+)"', pic)
+            pos = re.search(r'vertOffset="(\d+)" horzOffset="(\d+)"', pic)
+            if sz and pos:
+                w, h = int(sz.group(1)), int(sz.group(2))
+                d["sig_scale"] = round(max(0.25, min(3.0, h / float(SIG_H))), 3)
+                d["sig_dy"] = _s32(pos.group(1)) - SIG_VOFF
+                d["sig_dx"] = _s32(pos.group(2)) - (SIG_RIGHT - w)
+            d["signature"] = img("image1", "png")
+    return d
+
+
 # ---- 본체 --------------------------------------------------------------
-def build_hwpx(st, photos, signature, sig_scale=1.0, sig_dx=0, sig_dy=0):
+def build_hwpx(st, photos, signature, sig_scale=1.0, sig_dx=0, sig_dy=0,
+               attend=None):
     """st: 입력값 dict, photos: [PIL.Image|None]*3, signature: PIL.Image|None"""
     sec0 = base64.b64decode(TPL["Contents/section0.xml"]).decode("utf-8")
     hpf = base64.b64decode(TPL["Contents/content.hpf"]).decode("utf-8")
@@ -241,12 +497,37 @@ def build_hwpx(st, photos, signature, sig_scale=1.0, sig_dx=0, sig_dy=0):
         sec0 = sig_re.sub("", sec0, count=1)
         bins.append(("BinData/image1.png", base64.b64decode(TPL["BinData/image1.png"])))
 
-    # 8) content.hpf 에 이미지 등록
+    # 8) 수기 출석부 — 문서 맨 끝(3쪽)에 한 장 통째로 붙인다
+    sec1 = None
+    if attend is not None:
+        im = attend_fit(attend)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=90)
+        pw, ph = im.size
+        w, h = _attend_size(pw, ph)
+        bid = "image9"
+        extra_bins.append(("BinData/%s.jpg" % bid, buf.getvalue()))
+        extra_items.append('<opf:item id="%s" href="BinData/%s.jpg"'
+                           ' media-type="image/jpeg" isEmbeded="1"/>' % (bid, bid))
+        sec1 = base64.b64decode(TPL["Contents/section1.xml"]).decode("utf-8")
+        blank = ('<hp:p id="0" paraPrIDRef="25" styleIDRef="0" pageBreak="1"'
+                 ' columnBreak="0" merged="0"><hp:run charPrIDRef="11"/></hp:p>')
+        pic = ('<hp:p id="0" paraPrIDRef="25" styleIDRef="0" pageBreak="0"'
+               ' columnBreak="0" merged="0"><hp:run charPrIDRef="11">%s</hp:run></hp:p>'
+               % _attend_xml(bid, w, h, pw * PX2HU, ph * PX2HU))
+        sec1 = sec1.replace("</hs:sec>", blank + pic + "</hs:sec>", 1)
+
+    # 9) content.hpf 에 이미지 등록
     if extra_items:
         hpf = hpf.replace('<opf:item id="headersc"',
                           "".join(extra_items) + '<opf:item id="headersc"', 1)
 
-    # 9) zip 으로 묶기 (mimetype 은 반드시 첫 항목·무압축)
+    # 10) 첫 질문의 "네,아니오" 글자색을 검게 (원본은 파란색)
+    hdr = base64.b64decode(TPL["Contents/header.xml"]).decode("utf-8")
+    hdr = hdr.replace('<hh:charPr id="16" height="1000" textColor="#3057B9"',
+                      '<hh:charPr id="16" height="1000" textColor="#000000"', 1)
+
+    # 11) zip 으로 묶기 (mimetype 은 반드시 첫 항목·무압축)
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as z:
         z.writestr(zipfile.ZipInfo("mimetype"), base64.b64decode(TPL["mimetype"]),
@@ -254,8 +535,12 @@ def build_hwpx(st, photos, signature, sig_scale=1.0, sig_dx=0, sig_dy=0):
         for name in ZIP_ORDER:
             if name == "Contents/section0.xml":
                 data = sec0.encode("utf-8")
+            elif name == "Contents/section1.xml" and sec1 is not None:
+                data = sec1.encode("utf-8")
             elif name == "Contents/content.hpf":
                 data = hpf.encode("utf-8")
+            elif name == "Contents/header.xml":
+                data = hdr.encode("utf-8")
             else:
                 data = base64.b64decode(TPL[name])
             z.writestr(name, data, zipfile.ZIP_DEFLATED)
